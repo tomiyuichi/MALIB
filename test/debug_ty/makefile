@@ -1,10 +1,11 @@
 # makefile for MALIB debug tools
 #
 #   make clean all
-#   ./sbfMALIB file.sbf    (writes ./sbfMALIB_01.csv - ./sbfMALIB_03.csv)
+#   ./sbfMALIB file.sbf    (writes ./sbfMALIB_01.csv - ./sbfMALIB_04.csv)
 #
 # The MALIB sources in ../../src are built as is. sbfMALIB.c includes
-# mdccssr.c itself and wraps decode_qzss_l6emsg() with the GNU linker.
+# mdccssr.c itself and wraps decode_qzss_l6emsg() and trace() with the GNU
+# linker.
 # Options follow app/consapp/rtkrcv/gcc/makefile.
 
 SRC    = ../../src
@@ -28,7 +29,7 @@ MALIB_SRCS = $(SRC)/rtkcmn.c $(SRC)/rcvraw.c $(SRC)/rtcm.c $(SRC)/rtcm2.c \
 all: $(PROGS)
 
 sbfMALIB: sbfMALIB.c $(SRC)/mdccssr.c $(MALIB_SRCS)
-	$(CC) $(CFLAGS) -o $@ $< $(MALIB_SRCS) -Wl,--wrap=decode_qzss_l6emsg $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $< $(MALIB_SRCS) -Wl,--wrap=decode_qzss_l6emsg,--wrap=trace $(LDLIBS)
 
 clean:
 	rm -f $(PROGS) *.o *.trace

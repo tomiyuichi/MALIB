@@ -9,10 +9,16 @@
 *   sbfMALIB_02.csv : "QZSRawL6 -> L6E" L6 header dump (Source = L6E only)
 *   sbfMALIB_03.csv : "QZSRawL6 -> MADOCA-PPP-1" subframe dump, assembled by
 *                     the MALIB decoder (decode_qzss_l6emsg())
+*   sbfMALIB_04.csv : "QZSRawL6 -> MADOCA-PPP-2" message dump, as cut out and
+*                     decoded by the MALIB decoders (decode_mcssr_*())
 *
 * mdccssr.c is included here to read its assembly state (_mcssr), and
 * decode_qzss_l6emsg() is wrapped by the linker (-Wl,--wrap) to observe each
-* call from septentrio.c. The MALIB sources are not modified.
+* call from septentrio.c. For sbfMALIB_04.csv, every complete subframe is
+* replayed with the message loop of decode_qzss_l6emsg() and the MALIB
+* decode_mcssr_*() on a copy of _mcssr (apply=0), and checked against the
+* real run. trace() is also wrapped to catch the MALIB error messages.
+* The MALIB sources are not modified.
 *
 * usage  : sbfMALIB file.sbf
 * return : 0: ok, 1: no QZSRawL6 block found, 2: usage/file error
@@ -20,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include "rtklib.h"
 #include "mdccssr.c" /* MALIB L6E decoder, built in this unit to access _mcssr */
 
@@ -34,6 +41,7 @@
 #define OUTFILE1       "sbfMALIB_01.csv" /* packet dump */
 #define OUTFILE2       "sbfMALIB_02.csv" /* L6E header dump */
 #define OUTFILE3       "sbfMALIB_03.csv" /* MADOCA-PPP subframe dump */
+#define OUTFILE4       "sbfMALIB_04.csv" /* MADOCA-PPP message dump */
 
 typedef struct {                    /* subframe being assembled by MALIB */
     int active;                     /* 1: assembly in progress */
@@ -47,8 +55,16 @@ typedef struct {                    /* subframe being assembled by MALIB */
 static raw_t  raw;  /* large structs: keep them off the stack */
 static rtcm_t rtcm;
 static sfrm_t sf;
-static FILE  *ofp3;
+static FILE  *ofp3, *ofp4;
 static int    n3;   /* rows in sbfMALIB_03.csv */
+static int    n4;   /* rows in sbfMALIB_04.csv */
+static int    nmis; /* replays that do not match the real run */
+static mcssr_t pre; /* _mcssr before the current decode_qzss_l6emsg() call */
+static mcssr_t rep; /* _mcssr used for the replay */
+static ssr_t  dummy_ssr[MAXSAT]; /* not written: replay uses apply=0 */
+static int    capture;           /* 1: keep MALIB trace(2) messages */
+static int    prescan;           /* 1: skip the L6E decoder (time search) */
+static char   errmsg[1024];      /* last MALIB trace(2) message */
 
 /* little-endian readers, same as septentrio.c */
 static uint16_t U2(const uint8_t *p) {uint16_t a; memcpy(&a,p,2); return a;}
@@ -57,8 +73,8 @@ static uint32_t U4(const uint8_t *p) {uint32_t a; memcpy(&a,p,4); return a;}
 static void usage(void)
 {
     fprintf(stderr, "usage: sbfMALIB file.sbf\n"
-                    "  writes %s, %s and %s to the current directory\n",
-                    OUTFILE1, OUTFILE2, OUTFILE3);
+                    "  writes %s, %s, %s and %s to the current directory\n",
+                    OUTFILE1, OUTFILE2, OUTFILE3, OUTFILE4);
 }
 
 /* SBF SVID to PRN string (QZSS only) */
@@ -219,6 +235,191 @@ static void write_row3(const char *status)
     sf.active = 0;
 }
 
+/* linker wrap of trace(): keep the MALIB error message while replaying */
+void __wrap_trace(int level, const char *format, ...)
+{
+    va_list ap;
+    char *p;
+
+    if (!capture || level > 2) return;
+    va_start(ap, format);
+    vsprintf(errmsg, format, ap);
+    va_end(ap);
+    for (p = errmsg; *p; p++) {
+        if (*p == ',') *p = ';';              /* keep the CSV columns */
+        else if (*p == '\n') { *p = '\0'; break; }
+    }
+}
+
+/* Compact SSR sub type name */
+static const char *st_name(int st)
+{
+    switch (st) {
+        case 1: return "Mask";
+        case 2: return "Orbit";
+        case 3: return "Clock";
+        case 4: return "Code Bias";
+        case 5: return "Phase Bias";
+        case 7: return "URA";
+    }
+    return "?";
+}
+
+/* GNSS ID name of the Compact SSR mask */
+static const char *gnss_name(int id, char *buf)
+{
+    switch (id) {
+        case 0: return "GPS";
+        case 1: return "GLONASS";
+        case 2: return "Galileo";
+        case 3: return "BDS";
+        case 4: return "QZSS";
+        case 7: return "BDS3";
+    }
+    sprintf(buf, "Undefined (%d)", id);
+    return buf;
+}
+
+/* GPS time to "TOW s (Day hh:mm:ss)" */
+static void tow2str(gtime_t t, char *str)
+{
+    static const char *wday[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    int week, tow = (int)(time2gpst(t, &week) + 0.5), s = tow % 86400;
+
+    sprintf(str, "%d s (%s %02d:%02d:%02d)", tow, wday[(tow / 86400) % 7],
+            s / 3600, s % 3600 / 60, s % 60);
+}
+
+/* header epoch time to GPST, taking the epoch nearest to the receiver time */
+static gtime_t hdrep2time(int st, unsigned int ep, gtime_t trcv)
+{
+    gtime_t t;
+    double dt;
+    int week;
+
+    if (st == MCSSR_ST_MASK) { /* GPS epoch time (s of week) */
+        time2gpst(trcv, &week);
+        t = gpst2time(week, ep);
+        dt = timediff(t, trcv);
+        if (dt >  302400.0) t = timeadd(t, -604800.0);
+        if (dt < -302400.0) t = timeadd(t,  604800.0);
+        return t;
+    }
+    t = timeadd(trcv, ep - fmod(time2gpst(trcv, &week), 3600.0)); /* hourly */
+    dt = timediff(t, trcv);
+    if (dt >  1800.0) t = timeadd(t, -3600.0);
+    if (dt < -1800.0) t = timeadd(t,  3600.0);
+    return t;
+}
+
+/* sbfMALIB_04.csv: one row per message found by MALIB in the subframe */
+static void write_row4(int no, int pos, int end, int skip, const char *pad)
+{
+    unsigned int st = getbitu(rep.buff, pos + 12, 4), ep, nep, nhead;
+    gtime_t trcv = gpst2time(sf.week_s, sf.tow_s * 0.001), tep;
+    char prn[16], gs[64], es[64], rt[64], rg[64], buf[32];
+    int j, n = 0;
+
+    nep = st == MCSSR_ST_MASK ? 20 : 12;
+    nhead = 16 + nep + 9; /* ST1: up to IOD SSR (No. of GNSS is payload) */
+    ep = getbitu(rep.buff, pos + 16, nep);
+    tep = hdrep2time(st, ep, trcv);
+    svid2str(sf.svid, prn);
+    time2str(trcv, gs, 3);
+    time2str(tep, es, 3);
+    if (end >= 0) { tow2str(rep.gt, rt); time2str(rep.gt, rg, 3); }
+    else strcpy(rt, "-"), strcpy(rg, "-");
+
+    fprintf(ofp4, "%d,%s,%d,%.3f,%s,%d,%d,", ++n4, prn, sf.week_s,
+            sf.tow_s * 0.001, gs, no, pos);
+    if (end >= 0) fprintf(ofp4, "%d,", end - pos);
+    else fprintf(ofp4, "-,");
+    fprintf(ofp4, "%u,%u %s,", getbitu(rep.buff, pos, 12), st, st_name(st));
+    if (st == MCSSR_ST_MASK) fprintf(ofp4, "%u s (TOW),", ep);
+    else fprintf(ofp4, "%u s (hourly %u:%02u),", ep, ep / 60, ep % 60);
+    fprintf(ofp4, "%s,%u,%u,%u,%s,%s,", es, getbitu(rep.buff, pos + 16 + nep, 4),
+            getbitu(rep.buff, pos + 20 + nep, 1),
+            getbitu(rep.buff, pos + 21 + nep, 4), rt, rg);
+    if (rep.tow0 < 0) fprintf(ofp4, "-,");
+    else fprintf(ofp4, "IOD %d @ %d,", rep.iod, rep.tow0 + rep.ep0);
+
+    /* status: MALIB result, rescanned bits before the message, padding */
+    if (skip > 0) fprintf(ofp4, "Found after skipping %d bit; ", skip);
+    if (end >= 0) fprintf(ofp4, "OK");
+    else fprintf(ofp4, "Decode error: %s", errmsg[0] ? errmsg : "-");
+    fprintf(ofp4, "%s,", pad);
+
+    /* payload: mask summary of MALIB for ST1, then the bits after the header */
+    if (end < 0) { fprintf(ofp4, "-\n"); return; }
+    if (st == MCSSR_ST_MASK) {
+        for (j = 0; j < MCSSR_MAX_SYS; j++) {
+            if (!rep.nsat[j]) continue;
+            fprintf(ofp4, "%s%s: %d", n++ ? " / " : "", gnss_name(j, buf), rep.nsat[j]);
+        }
+        fprintf(ofp4, " (total %d sats) | ", rep.ns);
+    }
+    write_hex(ofp4, rep.buff, pos + nhead, end - pos - nhead);
+    fprintf(ofp4, "\n");
+}
+
+/* one replay of the message loop of decode_qzss_l6emsg() from the state
+   before the call; writes the rows if pad != NULL, returns no. of messages */
+static int replay_pass(const char *pad, int *lastend)
+{
+    int i = 0, pos, mn, st, no = 0, skip = 0, nbit = sf.npkt * L6_DATA_BITS;
+
+    rep = pre;
+    memcpy(rep.buff, _mcssr.buff, MCSSR_BYTELEN);
+    capture = 1;
+    while (i < nbit) {
+        pos = i;
+        mn = getbitu(rep.buff, i, 12); i += 12;
+        if (mn != RTCM_MN_CSSR) { skip += 12; continue; }
+        st = getbitu(rep.buff, i, 4); i += 4;
+        if ((st != MCSSR_ST_MASK) && (st != MCSSR_ST_OC) &&
+            (st != MCSSR_ST_CC)   && (st != MCSSR_ST_CB) &&
+            (st != MCSSR_ST_PB)   && (st != MCSSR_ST_URA)) { skip += 16; continue; }
+
+        errmsg[0] = '\0';
+        switch (st) {
+            case MCSSR_ST_MASK: i = decode_mcssr_mask(&rep, i); break;
+            case MCSSR_ST_OC  : i = decode_mcssr_oc (&rep, dummy_ssr, i, 0); break;
+            case MCSSR_ST_CC  : i = decode_mcssr_cc (&rep, dummy_ssr, i, 0); break;
+            case MCSSR_ST_CB  : i = decode_mcssr_cb (&rep, dummy_ssr, i, 0); break;
+            case MCSSR_ST_PB  : i = decode_mcssr_pb (&rep, dummy_ssr, i, 0); break;
+            case MCSSR_ST_URA : i = decode_mcssr_ura(&rep, dummy_ssr, i, 0); break;
+        }
+        no++;
+        if (pad) write_row4(no, pos, i, skip, no == *lastend ? pad : "");
+        else *lastend = i;
+        skip = 0;
+        if (i < 0) break; /* MALIB stops the subframe on an error */
+    }
+    capture = 0;
+    return no;
+}
+
+/* replay a complete subframe: pass 1 finds the last message, pass 2 writes */
+static void replay_subframe(void)
+{
+    int k, nz = 0, end = -1, nmsg, nbit = sf.npkt * L6_DATA_BITS;
+    char pad[128] = "";
+
+    nmsg = replay_pass(NULL, &end);
+    if (nmsg > 0 && end >= 0 && end <= nbit) {
+        for (k = end; k < nbit; k++) if (getbitu(rep.buff, k, 1)) nz++;
+        sprintf(pad, "; rest after last message %d bit (%s)", nbit - end,
+                nz ? "non-zero: not decoded" : "all 0");
+    }
+    replay_pass(pad, &nmsg); /* the last message gets the padding note */
+
+    /* the replay must end in the same state as the real run */
+    if (rep.gt.time != _mcssr.gt.time || rep.tow0 != _mcssr.tow0 ||
+        rep.iod != _mcssr.iod) {
+        nmis++;
+    }
+}
+
 /* linker wrap of decode_qzss_l6emsg(): track the subframe assembly of MALIB */
 extern int __real_decode_qzss_l6emsg(rtcm_t *rtcm);
 
@@ -226,6 +427,8 @@ int __wrap_decode_qzss_l6emsg(rtcm_t *rtcm)
 {
     int mb = _mcssr.maxframe, fb = _mcssr.frame, ret, start, saved;
 
+    if (prescan) return 0;
+    pre = _mcssr;      /* state before this call, for the replay */
     _mcssr.ibuff = -1; /* probe: MALIB sets it to 0 only on a new subframe */
     ret = __real_decode_qzss_l6emsg(rtcm);
     start = _mcssr.ibuff == 0;
@@ -253,15 +456,32 @@ int __wrap_decode_qzss_l6emsg(rtcm_t *rtcm)
 
     /* maxframe is reset to 0 after the subframe is decoded */
     if (_mcssr.maxframe == 0) {
+        replay_subframe();
         write_row3(ret < 0 ? "Complete: decode error" : "Complete");
     }
     return ret;
 }
 
+/* time of the first SBF block, as rtksvr passes the stream time to init_mcssr() */
+static gtime_t first_time(FILE *fp)
+{
+    gtime_t t0 = {0};
+
+    prescan = 1;
+    init_raw(&raw, STRFMT_SEPT);
+    while (input_sbff(&raw, &rtcm, fp) >= -1) {
+        if (raw.time.time != 0) { t0 = raw.time; break; }
+    }
+    free_raw(&raw);
+    rewind(fp);
+    prescan = 0;
+    return t0;
+}
+
 int main(int argc, char **argv)
 {
     FILE *fp, *ofp1, *ofp2;
-    gtime_t t0 = {0};
+    gtime_t t0;
     uint8_t msg[L6_MSG_BYTES];
     char *file = NULL;
     int i, type, n1 = 0, n2 = 0, nng = 0, ncrc = 0, nshort = 0;
@@ -277,12 +497,13 @@ int main(int argc, char **argv)
         return 2;
     }
     if (!(ofp1 = fopen(OUTFILE1, "w")) || !(ofp2 = fopen(OUTFILE2, "w")) ||
-        !(ofp3 = fopen(OUTFILE3, "w"))) {
+        !(ofp3 = fopen(OUTFILE3, "w")) || !(ofp4 = fopen(OUTFILE4, "w"))) {
         fprintf(stderr, "error: cannot open output file\n");
         return 2;
     }
-    init_raw(&raw, STRFMT_SEPT);
     init_rtcm(&rtcm);
+    t0 = first_time(fp);
+    init_raw(&raw, STRFMT_SEPT);
     init_mcssr(t0); /* input_sbff() also runs the MALIB L6E decoder */
 
     fprintf(ofp1, "#,SVID,WN,TOW [s],GPST,Source,RxCh,Parity,RSCnt,L6 PRN,"
@@ -293,6 +514,9 @@ int main(int argc, char **argv)
     fprintf(ofp3, "#,SVID,L6 PRN,Facility,WN,TOW Start [s],GPST Start,"
             "TOW End [s],GPST End,Packets,Kind,Bit Length,Status,MsgNum,SubType,"
             "Epoch Time,UI / MMI,IOD SSR,Subframe Data (hex)\n");
+    fprintf(ofp4, "#,SVID,WN,SF TOW Start [s],SF GPST Start,SF Msg No.,"
+            "Bit Offset,Bit Length,MsgNum,SubType,Epoch Time,Epoch GPST,UI,MMI,"
+            "IOD SSR,Restored TOW,Restored GPST,Mask (ST1),Status,Payload (hex)\n");
 
     for (;;) {
         raw.buff[4] = raw.buff[5] = 0; /* mark buff as stale: type 0 */
@@ -315,11 +539,16 @@ int main(int argc, char **argv)
     fclose(ofp1);
     fclose(ofp2);
     fclose(ofp3);
+    fclose(ofp4);
 
     fprintf(stderr, "file          : %s\n", file);
     fprintf(stderr, "output        : %s (%d rows), %s (%d rows)\n",
             OUTFILE1, n1, OUTFILE2, n2);
-    fprintf(stderr, "                %s (%d rows)\n", OUTFILE3, n3);
+    fprintf(stderr, "                %s (%d rows), %s (%d rows)\n",
+            OUTFILE3, n3, OUTFILE4, n4);
+    if (nmis > 0) {
+        fprintf(stderr, "warning       : %d subframes: replay differs from MALIB run\n", nmis);
+    }
     fprintf(stderr, "QZSRawL6      : %d packets (L6E: %d, Parity NG: %d)\n", n1, n2, nng);
     fprintf(stderr, "skipped       : CRC error %d, short block %d\n", ncrc, nshort);
 
