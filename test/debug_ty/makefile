@@ -1,7 +1,7 @@
 # makefile for MALIB debug tools
 #
 #   make clean all
-#   ./sbfMALIB file.sbf    (writes ./sbfMALIB_01.csv - ./sbfMALIB_04.csv)
+#   ./sbfMALIB file.sbf    (writes ./sbfMALIB_01.csv - 04.csv, ./sbfMALIB_05.log)
 #
 # The MALIB sources in ../../src are built as is. sbfMALIB.c includes
 # mdccssr.c itself and wraps decode_qzss_l6emsg() and trace() with the GNU

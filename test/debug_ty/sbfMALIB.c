@@ -11,13 +11,16 @@
 *                     the MALIB decoder (decode_qzss_l6emsg())
 *   sbfMALIB_04.csv : "QZSRawL6 -> MADOCA-PPP-2" message dump, as cut out and
 *                     decoded by the MALIB decoders (decode_mcssr_*())
+*   sbfMALIB_05.log : "QZSRawL6 -> MADOCA-PPP-3" every ST1, as decoded by
+*                     decode_mcssr_mask() (text)
 *
 * mdccssr.c is included here to read its assembly state (_mcssr), and
 * decode_qzss_l6emsg() is wrapped by the linker (-Wl,--wrap) to observe each
 * call from septentrio.c. For sbfMALIB_04.csv, every complete subframe is
 * replayed with the message loop of decode_qzss_l6emsg() and the MALIB
 * decode_mcssr_*() on a copy of _mcssr (apply=0), and checked against the
-* real run. trace() is also wrapped to catch the MALIB error messages.
+* real run. trace() is also wrapped to catch the MALIB error messages and
+* the GNSS blocks of ST1 traced by decode_mcssr_mask().
 * The MALIB sources are not modified.
 *
 * usage  : sbfMALIB file.sbf
@@ -42,6 +45,7 @@
 #define OUTFILE2       "sbfMALIB_02.csv" /* L6E header dump */
 #define OUTFILE3       "sbfMALIB_03.csv" /* MADOCA-PPP subframe dump */
 #define OUTFILE4       "sbfMALIB_04.csv" /* MADOCA-PPP message dump */
+#define OUTFILE5       "sbfMALIB_05.log" /* every ST1 decoded by MALIB */
 
 typedef struct {                    /* subframe being assembled by MALIB */
     int active;                     /* 1: assembly in progress */
@@ -51,6 +55,24 @@ typedef struct {                    /* subframe being assembled by MALIB */
     int npkt;                       /* number of packets (_mcssr.frame) */
     uint8_t buff[MCSSR_BYTELEN];    /* copy of _mcssr.buff */
 } sfrm_t;
+
+typedef struct {                    /* GNSS block of ST1, as decoded by MALIB */
+    int gnssid, nsat, nsig, cmaflg; /* GNSS ID, Nsat, Nsig, Cell-mask flag */
+    uint32_t svhi, svlo;            /* satellite mask (upper 8 / lower 32 bits) */
+    unsigned int sigmask;           /* signal mask */
+    int cellmask[MCSSR_MAX_SATMASK];/* cell mask per satellite */
+    int cells;                      /* number of cells (cell mask bits set) */
+} st1blk_t;
+
+typedef struct {                    /* ST1 message, as decoded by MALIB */
+    int svid, week;                 /* SBF SVID, week of the subframe */
+    uint32_t tow_s;                 /* TOW (ms) of the first packet of the subframe */
+    unsigned int ep, udi, mmi, iod, nsys; /* header fields, No. of GNSS */
+    int nblk;                       /* number of GNSS blocks traced by MALIB */
+    st1blk_t blk[MCSSR_MAX_SYS];
+    int rlen[8];                    /* bits read by MALIB per sub type (-1: none) */
+    char status[192];               /* MALIB result, as in sbfMALIB_04.csv */
+} st1_t;
 
 static raw_t  raw;  /* large structs: keep them off the stack */
 static rtcm_t rtcm;
@@ -65,6 +87,10 @@ static ssr_t  dummy_ssr[MAXSAT]; /* not written: replay uses apply=0 */
 static int    capture;           /* 1: keep MALIB trace(2) messages */
 static int    prescan;           /* 1: skip the L6E decoder (time search) */
 static char   errmsg[1024];      /* last MALIB trace(2) message */
+static st1_t *st1s;               /* every ST1, in the order of decoding */
+static int    nst1, nst1max;
+static int    cur_st1 = -1;       /* ST1 of the mask in use (index of st1s) */
+static st1_t *cap_st1;            /* ST1 being decoded: collect GNSS blocks */
 
 /* little-endian readers, same as septentrio.c */
 static uint16_t U2(const uint8_t *p) {uint16_t a; memcpy(&a,p,2); return a;}
@@ -73,8 +99,9 @@ static uint32_t U4(const uint8_t *p) {uint32_t a; memcpy(&a,p,4); return a;}
 static void usage(void)
 {
     fprintf(stderr, "usage: sbfMALIB file.sbf\n"
-                    "  writes %s, %s, %s and %s to the current directory\n",
-                    OUTFILE1, OUTFILE2, OUTFILE3, OUTFILE4);
+                    "  writes %s, %s, %s, %s and %s\n"
+                    "  to the current directory\n",
+                    OUTFILE1, OUTFILE2, OUTFILE3, OUTFILE4, OUTFILE5);
 }
 
 /* SBF SVID to PRN string (QZSS only) */
@@ -239,8 +266,24 @@ static void write_row3(const char *status)
 void __wrap_trace(int level, const char *format, ...)
 {
     va_list ap;
+    st1blk_t *b;
     char *p;
 
+    /* GNSS block of ST1: same arguments as the trace(4) in decode_mcssr_mask() */
+    if (cap_st1 && !strncmp(format, "decode_mcssr_mask: gnssid=", 26)) {
+        if (cap_st1->nblk >= MCSSR_MAX_SYS) return;
+        b = cap_st1->blk + cap_st1->nblk++;
+        va_start(ap, format);
+        b->gnssid  = va_arg(ap, int);
+        b->svhi    = (uint32_t)va_arg(ap, int); /* (uint8_t)(svmask>>32) */
+        b->svlo    = va_arg(ap, unsigned int);
+        b->sigmask = (unsigned int)va_arg(ap, int); /* uint16_t */
+        b->cmaflg  = va_arg(ap, int);
+        b->nsat    = va_arg(ap, int);
+        b->nsig    = va_arg(ap, int);
+        va_end(ap);
+        return;
+    }
     if (!capture || level > 2) return;
     va_start(ap, format);
     vsprintf(errmsg, format, ap);
@@ -280,14 +323,33 @@ static const char *gnss_name(int id, char *buf)
     return buf;
 }
 
+/* seconds of week to "TOW s (Day hh:mm:ss)", Day is "?" beyond a week */
+static void towday2str(unsigned int tow, char *str)
+{
+    static const char *wday[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    unsigned int s = tow % 86400;
+
+    sprintf(str, "%u s (%s %02u:%02u:%02u)", tow, tow / 86400 < 7 ?
+            wday[tow / 86400] : "?", s / 3600, s % 3600 / 60, s % 60);
+}
+
 /* GPS time to "TOW s (Day hh:mm:ss)" */
 static void tow2str(gtime_t t, char *str)
 {
-    static const char *wday[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-    int week, tow = (int)(time2gpst(t, &week) + 0.5), s = tow % 86400;
+    int week;
 
-    sprintf(str, "%d s (%s %02d:%02d:%02d)", tow, wday[(tow / 86400) % 7],
-            s / 3600, s % 3600 / 60, s % 60);
+    towday2str((unsigned int)(time2gpst(t, &week) + 0.5), str);
+}
+
+/* status column: MALIB result, rescanned bits before the message, padding */
+static void status2str(int end, int skip, const char *pad, char *str)
+{
+    char *p = str;
+
+    if (skip > 0) p += sprintf(p, "Found after skipping %d bit; ", skip);
+    if (end >= 0) p += sprintf(p, "OK");
+    else p += sprintf(p, "Decode error: %.120s", errmsg[0] ? errmsg : "-");
+    sprintf(p, "%s", pad);
 }
 
 /* header epoch time to GPST, taking the epoch nearest to the receiver time */
@@ -317,7 +379,7 @@ static void write_row4(int no, int pos, int end, int skip, const char *pad)
 {
     unsigned int st = getbitu(rep.buff, pos + 12, 4), ep, nep, nhead;
     gtime_t trcv = gpst2time(sf.week_s, sf.tow_s * 0.001), tep;
-    char prn[16], gs[64], es[64], rt[64], rg[64], buf[32];
+    char prn[16], gs[64], es[64], rt[64], rg[64], buf[32], stat[256];
     int j, n = 0;
 
     nep = st == MCSSR_ST_MASK ? 20 : 12;
@@ -343,11 +405,8 @@ static void write_row4(int no, int pos, int end, int skip, const char *pad)
     if (rep.tow0 < 0) fprintf(ofp4, "-,");
     else fprintf(ofp4, "IOD %d @ %d,", rep.iod, rep.tow0 + rep.ep0);
 
-    /* status: MALIB result, rescanned bits before the message, padding */
-    if (skip > 0) fprintf(ofp4, "Found after skipping %d bit; ", skip);
-    if (end >= 0) fprintf(ofp4, "OK");
-    else fprintf(ofp4, "Decode error: %s", errmsg[0] ? errmsg : "-");
-    fprintf(ofp4, "%s,", pad);
+    status2str(end, skip, pad, stat);
+    fprintf(ofp4, "%s,", stat);
 
     /* payload: mask summary of MALIB for ST1, then the bits after the header */
     if (end < 0) { fprintf(ofp4, "-\n"); return; }
@@ -360,6 +419,49 @@ static void write_row4(int no, int pos, int end, int skip, const char *pad)
     }
     write_hex(ofp4, rep.buff, pos + nhead, end - pos - nhead);
     fprintf(ofp4, "\n");
+}
+
+/* new ST1 record for the message at bit pos of the replayed subframe */
+static st1_t *new_st1(int pos)
+{
+    st1_t *s;
+    int k;
+
+    if (nst1 >= nst1max) {
+        nst1max = nst1max ? nst1max * 2 : 256;
+        if (!(st1s = (st1_t *)realloc(st1s, sizeof(st1_t) * nst1max))) {
+            fprintf(stderr, "error: out of memory\n");
+            exit(2);
+        }
+    }
+    s = st1s + nst1++;
+    memset(s, 0, sizeof(st1_t));
+    s->svid  = sf.svid;
+    s->week  = sf.week_s;
+    s->tow_s = sf.tow_s;
+    s->ep    = getbitu(rep.buff, pos + 16, 20);
+    s->udi   = getbitu(rep.buff, pos + 36, 4);
+    s->mmi   = getbitu(rep.buff, pos + 40, 1);
+    s->iod   = getbitu(rep.buff, pos + 41, 4);
+    s->nsys  = getbitu(rep.buff, pos + 45, 4);
+    for (k = 0; k < 8; k++) s->rlen[k] = -1;
+    return s;
+}
+
+/* complete an ST1 record with the cell masks left in the replayed _mcssr */
+static void finish_st1(st1_t *s, int pos, int end, int skip, const char *pad)
+{
+    int j, k, off = 0;
+
+    if (end >= 0) s->rlen[MCSSR_ST_MASK] = end - pos;
+    for (j = 0; j < s->nblk; j++) {
+        for (k = 0; k < s->blk[j].nsat && off + k < MAXSAT; k++) {
+            if (k < MCSSR_MAX_SATMASK) s->blk[j].cellmask[k] = rep.cellmask[off + k];
+            s->blk[j].cells += rep.ncell[off + k];
+        }
+        off += s->blk[j].nsat;
+    }
+    status2str(end, skip, pad, s->status);
 }
 
 /* one replay of the message loop of decode_qzss_l6emsg() from the state
@@ -381,6 +483,7 @@ static int replay_pass(const char *pad, int *lastend)
             (st != MCSSR_ST_PB)   && (st != MCSSR_ST_URA)) { skip += 16; continue; }
 
         errmsg[0] = '\0';
+        if (pad && st == MCSSR_ST_MASK) cap_st1 = new_st1(pos);
         switch (st) {
             case MCSSR_ST_MASK: i = decode_mcssr_mask(&rep, i); break;
             case MCSSR_ST_OC  : i = decode_mcssr_oc (&rep, dummy_ssr, i, 0); break;
@@ -390,6 +493,14 @@ static int replay_pass(const char *pad, int *lastend)
             case MCSSR_ST_URA : i = decode_mcssr_ura(&rep, dummy_ssr, i, 0); break;
         }
         no++;
+        if (cap_st1) { /* ST1: record it, the following messages use its mask */
+            finish_st1(cap_st1, pos, i, skip, no == *lastend ? pad : "");
+            cur_st1 = (int)(cap_st1 - st1s);
+            cap_st1 = NULL;
+        }
+        else if (pad && cur_st1 >= 0 && i >= 0 && st1s[cur_st1].rlen[st] < 0) {
+            st1s[cur_st1].rlen[st] = i - pos; /* first message with this mask */
+        }
         if (pad) write_row4(no, pos, i, skip, no == *lastend ? pad : "");
         else *lastend = i;
         skip = 0;
@@ -462,6 +573,265 @@ int __wrap_decode_qzss_l6emsg(rtcm_t *rtcm)
     return ret;
 }
 
+/* satellite name prefix of the Compact SSR GNSS ID */
+static const char *sat_prefix(int id)
+{
+    switch (id) {
+        case 0: return "G";
+        case 1: return "R";
+        case 2: return "E";
+        case 3: case 7: return "C";
+        case 4: return "J";
+    }
+    return "?";
+}
+
+/* satellite ID (1-40) is set in the satellite mask */
+static int blk_has_sat(const st1blk_t *b, int id)
+{
+    int n = MCSSR_MAX_SATMASK - id;
+
+    return n >= 32 ? (b->svhi >> (n - 32)) & 1 : (b->svlo >> n) & 1;
+}
+
+/* index of satellite ID in the block (-1: not set) */
+static int blk_sat_index(const st1blk_t *b, int id)
+{
+    int i, k = 0;
+
+    for (i = 1; i <= MCSSR_MAX_SATMASK; i++) {
+        if (!blk_has_sat(b, i)) continue;
+        if (i == id) return k;
+        k++;
+    }
+    return -1;
+}
+
+/* GNSS block of the given GNSS ID */
+static const st1blk_t *find_blk(const st1_t *s, int gnssid)
+{
+    int j;
+
+    for (j = 0; j < s->nblk; j++) if (s->blk[j].gnssid == gnssid) return s->blk + j;
+    return NULL;
+}
+
+/* message length of a sub type derived from the ST1 mask (Table 4.2.2-1) */
+static int st1_bits(const st1_t *s, int st)
+{
+    int j, n = 0, nsat = 0, cells = 0;
+
+    for (j = 0; j < s->nblk; j++) {
+        nsat  += s->blk[j].nsat;
+        cells += s->blk[j].cells;
+        if (st == 1) n += 61 + (s->blk[j].cmaflg ? s->blk[j].nsat * s->blk[j].nsig : 0);
+        if (st == 2) n += (s->blk[j].gnssid == MCSSR_SYS_GAL ? 51 : 49) * s->blk[j].nsat;
+    }
+    switch (st) {
+        case 1: return 49 + n;
+        case 2: return 37 + n;
+        case 3: return 37 + 15 * nsat;
+        case 4: return 37 + 11 * cells;
+        case 5: return 37 + 17 * cells;
+        case 7: return 37 + 6 * nsat;
+    }
+    return -1;
+}
+
+/* total number of satellites of an ST1 */
+static int st1_nsat(const st1_t *s)
+{
+    int j, n = 0;
+
+    for (j = 0; j < s->nblk; j++) n += s->blk[j].nsat;
+    return n;
+}
+
+/* differences of an ST1 mask from the previous ST1 of the same satellite */
+static void mask_changes(const st1_t *p, const st1_t *c, char *out)
+{
+    const st1blk_t *pb, *cb;
+    const char *name;
+    char *q = out, nbuf[32], b1[20], b2[20];
+    int j, id, n, pk;
+
+    *q = '\0';
+    if (p->iod != c->iod) q += sprintf(q, " / IOD SSR %u->%u", p->iod, c->iod);
+    for (j = 0; j < c->nblk; j++) {
+        cb = c->blk + j;
+        name = gnss_name(cb->gnssid, nbuf);
+        if (!(pb = find_blk(p, cb->gnssid))) { q += sprintf(q, " / %s added", name); continue; }
+        for (n = 0, id = 1; id <= MCSSR_MAX_SATMASK; id++) {
+            if (blk_has_sat(cb, id) == blk_has_sat(pb, id)) continue;
+            if (n++ == 0) q += sprintf(q, " / %s:", name);
+            q += sprintf(q, " %c%s%02d", blk_has_sat(cb, id) ? '+' : '-',
+                         sat_prefix(cb->gnssid), id);
+        }
+        if (pb->sigmask != cb->sigmask) {
+            bin2str(pb->sigmask, 16, b1);
+            bin2str(cb->sigmask, 16, b2);
+            q += sprintf(q, " / %s: Signal mask %s->%s", name, b1, b2);
+        }
+        if (pb->cmaflg != cb->cmaflg) {
+            q += sprintf(q, " / %s: Cell-mask Flag %d->%d", name, pb->cmaflg, cb->cmaflg);
+        }
+        if (pb->sigmask != cb->sigmask) continue;
+        for (n = 0, id = 1; id <= MCSSR_MAX_SATMASK; id++) {
+            if (!blk_has_sat(cb, id) || (pk = blk_sat_index(pb, id)) < 0) continue;
+            if (pk >= MCSSR_MAX_SATMASK) continue;
+            if (pb->cellmask[pk] == cb->cellmask[blk_sat_index(cb, id)]) continue;
+            if (n++ == 0) q += sprintf(q, " / %s: Cell mask changed", name);
+            q += sprintf(q, " %s%02d", sat_prefix(cb->gnssid), id);
+        }
+    }
+    for (j = 0; j < p->nblk; j++) {
+        if (find_blk(c, p->blk[j].gnssid)) continue;
+        q += sprintf(q, " / %s removed", gnss_name(p->blk[j].gnssid, nbuf));
+    }
+    if (out[0]) memmove(out, out + 3, strlen(out + 3) + 1); /* drop leading " / " */
+}
+
+/* "GPS 26 / GLONASS 13 / ..." */
+static void nsat_per_gnss(const st1_t *s, char *str)
+{
+    char buf[32];
+    int j;
+
+    *str = '\0';
+    for (j = 0; j < s->nblk; j++) {
+        str += sprintf(str, "%s%s %d", j ? " / " : "", gnss_name(s->blk[j].gnssid, buf),
+                       s->blk[j].nsat);
+    }
+}
+
+/* changes column of the overview, prev[] tracks the last ST1 per SVID */
+static void change_str(int n, const int *prev, char *str)
+{
+    const st1_t *s = st1s + n;
+    char *p = str;
+
+    *p = '\0';
+    if (strcmp(s->status, "OK")) p += sprintf(p, "[%s] ", s->status);
+    if (prev[s->svid] < 0) sprintf(p, "(first ST1 of this satellite)");
+    else {
+        mask_changes(st1s + prev[s->svid], s, p);
+        if (!*p) sprintf(p, "No change");
+    }
+}
+
+/* sbfMALIB_05.log: overview of every ST1 and the details of each */
+static void write_log5(FILE *fp)
+{
+    static const int sts[] = {1, 2, 3, 4, 5, 7};
+    static const char *formula[] = {
+        "49 + sum(61 + Ncell)", "37 + sum(49 or 51 (Galileo) x Nsat)",
+        "37 + 15 x Nsat", "37 + 11 x sum(signals x sats)",
+        "37 + 17 x sum(signals x sats)", "37 + 6 x Nsat"
+    };
+    const st1_t *s;
+    const st1blk_t *b;
+    char prn[16], ts[64], gs[64], ns[512], ch[4096], buf[32], bin[20];
+    int prev[256], i, j, k, id, w = 13, nchg = 0, nerr = 0, nskip = 0, d;
+
+    for (i = 0; i < 256; i++) prev[i] = -1;
+    for (i = 0; i < nst1; i++) {
+        change_str(i, prev, ch);
+        if (prev[st1s[i].svid] >= 0 && strcmp(ch, "No change")) nchg++;
+        if (strstr(st1s[i].status, "Decode error")) nerr++;
+        if (strstr(st1s[i].status, "Found after skipping")) nskip++;
+        prev[st1s[i].svid] = i;
+        nsat_per_gnss(st1s + i, ns);
+        if ((int)strlen(ns) > w) w = (int)strlen(ns);
+    }
+    fprintf(fp, "MADOCA-PPP-3 overview (every ST1 in the file, decoded by MALIB)\n\n");
+    fprintf(fp, "Number of ST1                    : %d\n", nst1);
+    fprintf(fp, "Mask changed from previous ST1   : %d\n", nchg);
+    fprintf(fp, "ST1 with decode error            : %d\n", nerr);
+    fprintf(fp, "ST1 found after skipping bits    : %d\n\n", nskip);
+
+    fprintf(fp, "%4s  %-4s  %16s  %-24s  %3s  %4s  %-*s  %5s  %-35s  %s\n", "#",
+            "SVID", "SF TOW Start [s]", "GPS Epoch Time", "IOD", "Nsys", w,
+            "Nsat per GNSS", "Total", "Derived length [bit]: ST1-5, ST7",
+            "Changes from previous ST1");
+    for (i = 0; i < 256; i++) prev[i] = -1;
+    for (i = 0; i < nst1; i++) {
+        s = st1s + i;
+        svid2str(s->svid, prn);
+        towday2str(s->ep, ts);
+        nsat_per_gnss(s, ns);
+        change_str(i, prev, ch);
+        prev[s->svid] = i;
+        fprintf(fp, "%4d  %-4s  %16.3f  %-24s  %3u  %4u  %-*s  %5d  ", i + 1, prn,
+                s->tow_s * 0.001, ts, s->iod, s->nsys, w, ns, st1_nsat(s));
+        for (j = 0; j < 6; j++) fprintf(fp, "%5d%s", st1_bits(s, sts[j]), j < 5 ? " " : "");
+        fprintf(fp, "  %s\n", ch);
+    }
+
+    for (i = 0; i < 256; i++) prev[i] = -1;
+    for (i = 0; i < nst1; i++) {
+        s = st1s + i;
+        svid2str(s->svid, prn);
+        change_str(i, prev, ch);
+        prev[s->svid] = i;
+        time2str(gpst2time(s->week, s->tow_s * 0.001), gs, 3);
+        towday2str(s->ep, ts);
+
+        fprintf(fp, "\n==== ST1 #%d - %s / SF TOW %.3f s (%s) / IOD SSR %u ====\n",
+                i + 1, prn, s->tow_s * 0.001, gs, s->iod);
+        fprintf(fp, "Status (MALIB)             : %s\n", s->status);
+        fprintf(fp, "Changes from previous ST1  : %s\n", ch);
+        fprintf(fp, "Message Number             : %d\n", RTCM_MN_CSSR);
+        fprintf(fp, "Message Sub Type ID        : %d\n", MCSSR_ST_MASK);
+        fprintf(fp, "GPS Epoch Time 1s          : %s\n", ts);
+        fprintf(fp, "SSR Update Interval        : %u\n", s->udi);
+        fprintf(fp, "Multiple Message Indicator : %u\n", s->mmi);
+        fprintf(fp, "IOD SSR                    : %u\n", s->iod);
+        fprintf(fp, "No. of GNSS (Nsys)         : %u\n", s->nsys);
+        fprintf(fp, "Total sats (Nsat)          : %d\n", st1_nsat(s));
+        if (s->rlen[1] >= 0) fprintf(fp, "Message length             : %d bit (read by MALIB)\n", s->rlen[1]);
+        else fprintf(fp, "Message length             : - (decode error)\n");
+
+        fprintf(fp, "\n  %-16s  %-20s  %4s  %-23s  %4s  %14s  %5s  %18s\n", "GNSS ID",
+                "Satellite mask (hex)", "Nsat", "Signal mask (hex / bin)", "Nsig",
+                "Cell-mask Flag", "Ncell", "Block length [bit]");
+        for (j = 0; j < s->nblk; j++) {
+            b = s->blk + j;
+            bin2str(b->sigmask, 16, bin);
+            sprintf(ns, "%d %s", b->gnssid, gnss_name(b->gnssid, buf));
+            k = b->cmaflg ? b->nsat * b->nsig : 0;
+            fprintf(fp, "  %-16s  %02X%08X            %4d  %04X / %s  %4d  %14d  %5d  %18d\n",
+                    ns, (unsigned int)b->svhi, (unsigned int)b->svlo, b->nsat,
+                    b->sigmask, bin, b->nsig, b->cmaflg, k, 61 + k);
+            fprintf(fp, "    Satellites :");
+            for (id = 1; id <= MCSSR_MAX_SATMASK; id++) {
+                if (blk_has_sat(b, id)) fprintf(fp, " %s%02d", sat_prefix(b->gnssid), id);
+            }
+            fprintf(fp, "\n    Cell mask  :");
+            if (!b->cmaflg) fprintf(fp, " (none: all sats x all signals)");
+            else {
+                for (k = 0, id = 1; id <= MCSSR_MAX_SATMASK; id++) {
+                    if (!blk_has_sat(b, id) || k >= MCSSR_MAX_SATMASK) continue;
+                    bin2str((unsigned int)b->cellmask[k++], b->nsig, bin);
+                    fprintf(fp, " %s%02d:%s", sat_prefix(b->gnssid), id, bin);
+                }
+            }
+            fprintf(fp, "\n");
+        }
+
+        fprintf(fp, "\n  Message lengths derived from this ST1, and read by MALIB with this mask\n");
+        fprintf(fp, "  %-8s  %-10s  %-36s  %12s  %16s\n", "Sub Type", "Message",
+                "Formula", "Length [bit]", "MALIB read [bit]");
+        for (j = 0; j < 6; j++) {
+            d = st1_bits(s, sts[j]);
+            fprintf(fp, "  ST%-6d  %-10s  %-36s  %12d  ", sts[j], st_name(sts[j]),
+                    formula[j], d);
+            if (s->rlen[sts[j]] < 0) fprintf(fp, "%16s\n", "-");
+            else fprintf(fp, "%16d%s\n", s->rlen[sts[j]],
+                         s->rlen[sts[j]] != d ? "  <- differs" : "");
+        }
+    }
+}
+
 /* time of the first SBF block, as rtksvr passes the stream time to init_mcssr() */
 static gtime_t first_time(FILE *fp)
 {
@@ -480,7 +850,7 @@ static gtime_t first_time(FILE *fp)
 
 int main(int argc, char **argv)
 {
-    FILE *fp, *ofp1, *ofp2;
+    FILE *fp, *ofp1, *ofp2, *ofp5;
     gtime_t t0;
     uint8_t msg[L6_MSG_BYTES];
     char *file = NULL;
@@ -497,7 +867,8 @@ int main(int argc, char **argv)
         return 2;
     }
     if (!(ofp1 = fopen(OUTFILE1, "w")) || !(ofp2 = fopen(OUTFILE2, "w")) ||
-        !(ofp3 = fopen(OUTFILE3, "w")) || !(ofp4 = fopen(OUTFILE4, "w"))) {
+        !(ofp3 = fopen(OUTFILE3, "w")) || !(ofp4 = fopen(OUTFILE4, "w")) ||
+        !(ofp5 = fopen(OUTFILE5, "w"))) {
         fprintf(stderr, "error: cannot open output file\n");
         return 2;
     }
@@ -540,12 +911,16 @@ int main(int argc, char **argv)
     fclose(ofp2);
     fclose(ofp3);
     fclose(ofp4);
+    write_log5(ofp5);
+    fclose(ofp5);
+    free(st1s);
 
     fprintf(stderr, "file          : %s\n", file);
     fprintf(stderr, "output        : %s (%d rows), %s (%d rows)\n",
             OUTFILE1, n1, OUTFILE2, n2);
     fprintf(stderr, "                %s (%d rows), %s (%d rows)\n",
             OUTFILE3, n3, OUTFILE4, n4);
+    fprintf(stderr, "                %s (%d ST1)\n", OUTFILE5, nst1);
     if (nmis > 0) {
         fprintf(stderr, "warning       : %d subframes: replay differs from MALIB run\n", nmis);
     }
