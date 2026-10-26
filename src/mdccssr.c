@@ -39,6 +39,7 @@
 #define MCSSR_SYS_GAL               2
 #define MCSSR_SYS_BDS               3
 #define MCSSR_SYS_QZS               4
+#define MCSSR_SYS_BD3               7
 
 #define MCSSR_MAX_SATMASK          40   /* Satellite Mask (Table 4.2.2-8) */
 #define MCSSR_SATMASK_GPS_U  0xFFFFFFFFu /* Note, U and L for -Wlong-long Avoidance */
@@ -51,6 +52,8 @@
 #define MCSSR_SATMASK_BDS_L  0xFF
 #define MCSSR_SATMASK_QZS_U  0xFFC00000u
 #define MCSSR_SATMASK_QZS_L  0x00
+#define MCSSR_SATMASK_BD3_U  0xFFFFFFFFu
+#define MCSSR_SATMASK_BD3_L  0xFF
 #define MCSSR_SATMASK_RSV_U  0xFFFFFFFFu
 #define MCSSR_SATMASK_RSV_L  0xFF
 
@@ -83,6 +86,10 @@ static const uint8_t cssr_sig_gal[16]={
 static const uint8_t cssr_sig_cmp[16]={
     CODE_L2I,CODE_L2Q,CODE_L2X,CODE_L6I,CODE_L6Q,CODE_L6X,CODE_L7I,CODE_L7Q,
     CODE_L7X,       0,       0,       0,       0,       0,       0,       0
+};
+static const uint8_t cssr_sig_bd3[16]={
+    CODE_L2I,CODE_L2Q,       0,CODE_L6I,CODE_L6Q,       0,CODE_L7D,CODE_L7P,
+    CODE_L7Z,CODE_L1D,CODE_L1P,CODE_L1X,CODE_L5D,CODE_L5P,CODE_L5X,       0
 };
 static const uint8_t cssr_sig_qzs[16]={
     CODE_L1C,CODE_L1S,CODE_L1L,CODE_L1X,CODE_L2S,CODE_L2L,CODE_L2X,CODE_L5I,
@@ -234,6 +241,7 @@ static int gnssid2sys(const int gnssid)
         case MCSSR_SYS_GAL : return SYS_GAL;
         case MCSSR_SYS_BDS : return SYS_CMP;
         case MCSSR_SYS_QZS : return SYS_QZS;
+        case MCSSR_SYS_BD3 : return SYS_CMP;
     }
     return SYS_NONE;
 }
@@ -245,7 +253,7 @@ static int svmask2list(const uint64_t mask, const int gnssid, int *satlist, int 
 
     for(i = 0; i < MCSSR_MAX_SATMASK; i++){
         if(mask & svbit) {
-            offp = (gnssid == MCSSR_SYS_QZS)? 193 : 1;
+            offp = (gnssid == MCSSR_SYS_QZS)? 193 : (gnssid == MCSSR_SYS_BD3)? 19 : 1;
             satlist[ns] = satno(gnssid2sys(gnssid),offp+i);
             gidlist[ns] = gnssid;
             ns++;
@@ -268,6 +276,7 @@ static int sigmask2list(const uint16_t mask, const int gnssid, int *siglist)
         case MCSSR_SYS_GAL : sigs = cssr_sig_gal; break;
         case MCSSR_SYS_BDS : sigs = cssr_sig_cmp; break;
         case MCSSR_SYS_QZS : sigs = cssr_sig_qzs; break;
+        case MCSSR_SYS_BD3 : sigs = cssr_sig_bd3; break;
         default            : sigs = cssr_sig_rsv;
     }
 
@@ -360,6 +369,7 @@ static int decode_mcssr_mask(mcssr_t *mc, int i)
             case MCSSR_SYS_GAL : gnssmask = ((uint64_t)MCSSR_SATMASK_GAL_U) << 8 | MCSSR_SATMASK_GAL_L; break;
             case MCSSR_SYS_BDS : gnssmask = ((uint64_t)MCSSR_SATMASK_BDS_U) << 8 | MCSSR_SATMASK_BDS_L; break;
             case MCSSR_SYS_QZS : gnssmask = ((uint64_t)MCSSR_SATMASK_QZS_U) << 8 | MCSSR_SATMASK_QZS_L; break;
+            case MCSSR_SYS_BD3 : gnssmask = ((uint64_t)MCSSR_SATMASK_BD3_U) << 8 | MCSSR_SATMASK_BD3_L; break;
             default            : gnssmask = ((uint64_t)MCSSR_SATMASK_RSV_U) << 8 | MCSSR_SATMASK_RSV_L;
                                  trace(2,"decode_mcssr_mask: reserved gnssid=%d\n",gnssid);
         }
@@ -563,7 +573,7 @@ static int decode_mcssr_cb(mcssr_t *mc, ssr_t *ssr, int i, int apply)
 #ifdef TRACE_MCSSR
         tread = tsat0 = tinv = 0;
 #endif
-        for (k = 0; k < nsig; k++) {
+        for (k = 0; k < nsig; k++, mask >>= 1) {
             if((flg = (mc->cellmask[j] & mask))) {
                 cb = getbits(mc->buff, i, 11); i+=11; /* Code Bias */
 #ifdef TRACE_MCSSR
@@ -579,7 +589,6 @@ static int decode_mcssr_cb(mcssr_t *mc, ssr_t *ssr, int i, int apply)
 
                 cbias[mc->siglist[mc->gidlist[j]][k]-1] = cb * 0.02;
             }
-            mask >>= 1;
         }
 #ifdef TRACE_MCSSR
         if (tread != mc->ncell[j] || (apply && sat == 0)) {
@@ -638,7 +647,7 @@ static int decode_mcssr_pb(mcssr_t *mc, ssr_t *ssr, int i, int apply)
 #ifdef TRACE_MCSSR
         tread = tsat0 = tinv = 0;
 #endif
-        for (k = 0; k < nsig; k++) {
+        for (k = 0; k < nsig; k++, mask >>= 1) {
             if((flg = (mc->cellmask[j] & mask))) {
                 pb = getbits(mc->buff, i, 15); i+=15; /* Phase Bias */
                 di = getbitu(mc->buff, i,  2); i+= 2; /* Discontinuity Indicator */
@@ -656,7 +665,6 @@ static int decode_mcssr_pb(mcssr_t *mc, ssr_t *ssr, int i, int apply)
 
                 pbias[mc->siglist[mc->gidlist[j]][k]-1] = pb * 0.001;
             }
-            mask >>= 1;
         }
 #ifdef TRACE_MCSSR
         if (tread != mc->ncell[j] || (apply && sat == 0)) {
