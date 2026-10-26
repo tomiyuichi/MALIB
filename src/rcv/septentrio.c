@@ -64,6 +64,10 @@
 #define SBF_QZSRAWL6    4069    /* SBF QZSS L6 message */
 #define SBF_NAVICRAW    4093    /* SBF NavIC/IRNSS subframe */
 
+#if defined(TRACE_MCSSR) && !defined(TRACE_MCSSR_LV)
+#define TRACE_MCSSR_LV  2       /* trace level of MCSSRDBG lines (mdccssr.c) */
+#endif
+
 /* get fields (little-endian) ------------------------------------------------*/
 #define U1(p) (*((uint8_t *)(p)))
 #define I1(p) (*((int8_t  *)(p)))
@@ -755,7 +759,11 @@ static int decode_qzsrawl6(raw_t *raw, rtcm_t *rtcm)
     int prn, sat, week, i, j, ret;
     unsigned char svid, parity, rscnt, source, rxchannel;
     uint8_t *p=(raw->buff)+8;                   /* jump to TOW location */
-    unsigned char buff[256]; 
+    unsigned char buff[256];
+#ifdef TRACE_MCSSR
+    static gtime_t tprev[10];                   /* time of previous block (J01-J10) */
+    double dt=-1.0;
+#endif
 
     if (raw->len<272) {
         trace(2,"SBF decode_qzsrawl6 frame length error: len=%d\n",raw->len);
@@ -782,6 +790,15 @@ static int decode_qzsrawl6(raw_t *raw, rtcm_t *rtcm)
     }
     trace(3, "SBF QZSRawL6 : %s, prn=%d,SVID=%d, Parity=%d, RSCnt=%d, Source=%d, rxchannel=%d\n", 
         time_str(time,0), prn, svid, parity, rscnt, source, rxchannel);
+#ifdef TRACE_MCSSR
+    if (svid>=181&&svid<=190) {
+        if (tprev[svid-181].time) dt=timediff(time,tprev[svid-181]);
+        tprev[svid-181]=time;
+    }
+    trace(TRACE_MCSSR_LV,"MCSSRDBG,PKT,wn=%d,tow=%.3f,svid=%d,prn=%d,parity=%d,"
+          "rscnt=%d,source=%d,ch=%d,dt=%.3f\n",week,tow*0.001,svid,prn,parity,
+          rscnt,source,rxchannel,dt);
+#endif
 
     if (parity == 0) {
         trace(2, "SBF decode_qzsrawl6 RS decode error\n");

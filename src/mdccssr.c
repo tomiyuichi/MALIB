@@ -123,6 +123,100 @@ typedef struct {
 
 mcssr_t _mcssr;
 
+#ifdef TRACE_MCSSR
+/* debug trace of MADOCA-PPP L6E decoding (-DTRACE_MCSSR) ---------------------
+* every line is "MCSSRDBG,<event>,key=value,..." for extraction by tools
+* note   : decoding is not changed, only the state is traced
+*-----------------------------------------------------------------------------*/
+#ifndef TRACE_MCSSR_LV
+#define TRACE_MCSSR_LV              2   /* trace level of MCSSRDBG lines */
+#endif
+
+static void mctrace(const char *format, ...)
+{
+    va_list ap;
+    char buff[1024];
+
+    va_start(ap,format); vsprintf(buff,format,ap); va_end(ap);
+    trace(TRACE_MCSSR_LV,"MCSSRDBG,%s\n",buff);
+}
+/* gps time to "week:tow" ----------------------------------------------------*/
+static char *mctrace_gt(gtime_t t, char *str)
+{
+    double tow;
+    int week;
+
+    tow = time2gpst(t, &week);
+    sprintf(str, "%d:%.3f", week, tow);
+    return str;
+}
+/* message length expected from the current mask (Table 4.2.2-1) -------------*/
+static int mctrace_explen(const mcssr_t *mc, int st)
+{
+    int j, n = 0;
+
+    for (j = 0; j < mc->ns; j++) {
+        switch (st) {
+            case MCSSR_ST_OC : n += (mc->gidlist[j] == MCSSR_SYS_GAL)? 51: 49; break;
+            case MCSSR_ST_CC : n += 15; break;
+            case MCSSR_ST_CB : n += 11 * mc->ncell[j]; break;
+            case MCSSR_ST_PB : n += 17 * mc->ncell[j]; break;
+            case MCSSR_ST_URA: n += 6; break;
+            default          : return -1;
+        }
+    }
+    return 37 + n; /* header : 12+4+12+4+1+4 */
+}
+/* expected result of the mask/epoch/iod check in decode_mcssr_xx() ----------*/
+static void mctrace_chk(const mcssr_t *mc, int pos, int st, char *str)
+{
+    const char *res;
+    int ep, iod;
+
+    if (st == MCSSR_ST_MASK) {
+        sprintf(str, "chk=-");
+        return;
+    }
+    ep  = getbitu(mc->buff, pos + 16, 12);
+    iod = getbitu(mc->buff, pos + 33,  4);
+    if (mc->tow0 < 0) res = "nomask";
+    else {
+        if (mc->ep0 > ep) ep += 3600;
+        if      (ep >= mc->valep0) res = "expired";
+        else if (mc->iod != iod)   res = "iod";
+        else                       res = "ok";
+    }
+    sprintf(str, "chk=%s,ep_adj=%d,tow0=%d,ep0=%d,valep0=%d,iod_mask=%d",
+            res, ep, mc->tow0, mc->ep0, mc->valep0, mc->iod);
+}
+/* one message found in the subframe -----------------------------------------*/
+static void mctrace_msg(const mcssr_t *mc, int no, int pos, int skip, int st,
+                        int end, int exp, const char *chk)
+{
+    int n = (st == MCSSR_ST_MASK)? 20: 12, len = (end < 0)? -1: end - pos;
+    char gs[32];
+
+    mctrace("MSG,no=%d,pos=%d,skip=%d,st=%d,ep=%d,udi=%d,mmi=%d,iod=%d,"
+            "end=%d,len=%d,exp=%d,diff=%d,%s,gt=%s",
+            no, pos, skip, st, (int)getbitu(mc->buff, pos + 16, n),
+            (int)getbitu(mc->buff, pos + 16 + n, 4),
+            (int)getbitu(mc->buff, pos + 20 + n, 1),
+            (int)getbitu(mc->buff, pos + 21 + n, 4), end, len, exp,
+            (len < 0 || exp < 0)? 0: len - exp, chk, mctrace_gt(mc->gt, gs));
+}
+/* end of the message loop of the subframe -----------------------------------*/
+static void mctrace_sfend(const mcssr_t *mc, int last, int nbit, int ret)
+{
+    int k, nz = 0;
+    char gs[32];
+
+    for (k = last; k < nbit; k++) if (getbitu(mc->buff, k, 1)) nz++;
+    mctrace("SFEND,ret=%d,last=%d,nbit=%d,rest=%d,rest_nonzero=%d,overrun=%d,gt=%s",
+            ret, last, nbit, (last < nbit)? nbit - last: 0, nz,
+            (last > nbit)? last - nbit: 0, mctrace_gt(mc->gt, gs));
+}
+#endif /* TRACE_MCSSR */
+
 /* count 16 bit flags --------------------------------------------------------*/
 static int flgcnt16(const uint16_t flg)
 {
@@ -192,13 +286,23 @@ static void adjweek(gtime_t *gt, double tow)
 {
     double tow_p;
     int week;
-    
+#ifdef TRACE_MCSSR
+    gtime_t gt0 = *gt;
+    char gs0[32], gs1[32];
+#endif
+
     /* if no time, get cpu time */
     if (gt->time == 0) *gt = utc2gpst(timeget());
     tow_p = time2gpst(*gt, &week);
     if      (tow < tow_p - 302400.0) tow+=604800.0;
     else if (tow > tow_p + 302400.0) tow-=604800.0;
     *gt = gpst2time(week, tow);
+#ifdef TRACE_MCSSR
+    if (gt0.time != 0 && fabs(timediff(*gt, gt0)) > 3600.0) {
+        mctrace("GTJUMP,tow=%.0f,from=%s,to=%s,dt=%.0f", tow,
+                mctrace_gt(gt0, gs0), mctrace_gt(*gt, gs1), timediff(*gt, gt0));
+    }
+#endif
 }
 
 /* decode MADOCA-PPP L6E CSSR header -----------------------------------------*/
@@ -226,6 +330,10 @@ static int decode_mcssr_mask(mcssr_t *mc, int i)
     uint64_t svmask,gnssmask;
     uint16_t sigmask,cellmask;
     double udint;
+#ifdef TRACE_MCSSR
+    int tncell;
+    char gs[32];
+#endif
 
     i = decode_mcssr_head(mc, &sync, &iod, &ep, &udint, i, MCSSR_ST_MASK);
 
@@ -281,10 +389,29 @@ static int decode_mcssr_mask(mcssr_t *mc, int i)
                 mc->ncell[mc->ns + k] = nsig;
             }
         }
+#ifdef TRACE_MCSSR
+        for (k = tncell = 0; k < nsat; k++) tncell += mc->ncell[mc->ns + k];
+        mctrace("MASKBLK,blk=%d,gnssid=%d,sys_supported=%d,svmask=%02X%08X,"
+                "sigmask=%04X,cmaflg=%d,nsat=%d,nsig=%d,ncell=%d,blkbits=%d,"
+                "ns_end=%d,maxsat=%d",
+                j, gnssid, gnssid2sys(gnssid) != SYS_NONE,
+                (unsigned int)(uint8_t)(svmask>>32), (unsigned int)(uint32_t)svmask,
+                (unsigned int)sigmask, cmaflg, nsat, nsig, tncell,
+                61 + (cmaflg? nsat * nsig: 0), mc->ns + nsat, MAXSAT);
+#endif
         mc->nsat[gnssid] = nsat;
         mc->nsig[gnssid] = nsig;
         mc->ns += nsat;
     }
+#ifdef TRACE_MCSSR
+    mctrace("MASK,ep=%d,ep_valid=%d,udint=%.0f,mmi=%d,iod=%d,ngnss=%d,ns=%d,"
+            "tow0=%d,ep0=%d,valep0=%d,st2=%d,st3=%d,st4=%d,st5=%d,st7=%d,gt=%s",
+            ep, ep < 604800, udint, sync, iod, ngnss, mc->ns, mc->tow0, mc->ep0,
+            mc->valep0, mctrace_explen(mc, MCSSR_ST_OC),
+            mctrace_explen(mc, MCSSR_ST_CC), mctrace_explen(mc, MCSSR_ST_CB),
+            mctrace_explen(mc, MCSSR_ST_PB), mctrace_explen(mc, MCSSR_ST_URA),
+            mctrace_gt(mc->gt, gs));
+#endif
     return i;
 }
 
@@ -404,6 +531,9 @@ static int decode_mcssr_cb(mcssr_t *mc, ssr_t *ssr, int i, int apply)
     int j, k, sync, iod, ep, sat, nsig, mask, cb, flg;
     double udint,cbias[MAXCODE];
     char satid[8];
+#ifdef TRACE_MCSSR
+    int tread, tsat0, tinv;
+#endif
 
     i = decode_mcssr_head(mc, &sync, &iod, &ep, &udint, i, MCSSR_ST_CB);
     if(mc->tow0 < 0) {
@@ -430,9 +560,17 @@ static int decode_mcssr_cb(mcssr_t *mc, ssr_t *ssr, int i, int apply)
         satno2id(sat, satid);
         nsig = mc->nsig[mc->gidlist[j]];
         mask = 1 << (nsig - 1);
+#ifdef TRACE_MCSSR
+        tread = tsat0 = tinv = 0;
+#endif
         for (k = 0; k < nsig; k++) {
             if((flg = (mc->cellmask[j] & mask))) {
                 cb = getbits(mc->buff, i, 11); i+=11; /* Code Bias */
+#ifdef TRACE_MCSSR
+                tread++;
+                if      (sat == 0)                  tsat0++;
+                else if (cb == MCSSR_INVALID_11BIT) tinv++;
+#endif
                 trace(4,"decode_mcssr_cb :%s,i=%4d,j=%3d,k=%2d,sat=%s,flg=0x%2X,sig=%2d,cb=%5d,%6.2f\n",
                     time_str(mc->gt,3),i,j,k,satid,flg,mc->siglist[mc->gidlist[j]][k],cb,cb*0.02);
 
@@ -443,6 +581,14 @@ static int decode_mcssr_cb(mcssr_t *mc, ssr_t *ssr, int i, int apply)
             }
             mask >>= 1;
         }
+#ifdef TRACE_MCSSR
+        if (tread != mc->ncell[j] || (apply && sat == 0)) {
+            mctrace("BIASSAT,st=%d,j=%d,gnssid=%d,sat=%d,nsig=%d,cellmask=%X,"
+                    "ncell=%d,nread=%d,cont_sat0=%d,cont_invalid=%d,apply=%d,"
+                    "ssr_index=%d", MCSSR_ST_CB, j, mc->gidlist[j], sat, nsig,
+                    mc->cellmask[j], mc->ncell[j], tread, tsat0, tinv, apply, sat - 1);
+        }
+#endif
         if(apply) {
             ssr[sat-1].t0[4]   = mc->gt;
             ssr[sat-1].udi[4]  = udint;
@@ -460,6 +606,9 @@ static int decode_mcssr_pb(mcssr_t *mc, ssr_t *ssr, int i, int apply)
     int j, k, sync, iod, ep, sat, nsig, mask, pb, di, flg;
     double udint,pbias[MAXCODE];
     char satid[8];
+#ifdef TRACE_MCSSR
+    int tread, tsat0, tinv;
+#endif
 
     i = decode_mcssr_head(mc, &sync, &iod, &ep, &udint, i, MCSSR_ST_PB);
     if(mc->tow0 < 0) {
@@ -486,10 +635,18 @@ static int decode_mcssr_pb(mcssr_t *mc, ssr_t *ssr, int i, int apply)
         satno2id(sat, satid);
         nsig = mc->nsig[mc->gidlist[j]];
         mask = 1 << (nsig - 1);
+#ifdef TRACE_MCSSR
+        tread = tsat0 = tinv = 0;
+#endif
         for (k = 0; k < nsig; k++) {
             if((flg = (mc->cellmask[j] & mask))) {
                 pb = getbits(mc->buff, i, 15); i+=15; /* Phase Bias */
                 di = getbitu(mc->buff, i,  2); i+= 2; /* Discontinuity Indicator */
+#ifdef TRACE_MCSSR
+                tread++;
+                if      (sat == 0)                  tsat0++;
+                else if (pb == MCSSR_INVALID_15BIT) tinv++;
+#endif
 
                 trace(4,"decode_mcssr_pb :%s,i=%4d,j=%3d,k=%2d,sat=%s,flg=0x%2X,sig=%2d,di=%d,pb=%5d,%7.3f\n",
                     time_str(mc->gt,3),i,j,k,satid,flg,mc->siglist[mc->gidlist[j]][k],di,pb,pb*0.001);
@@ -501,6 +658,14 @@ static int decode_mcssr_pb(mcssr_t *mc, ssr_t *ssr, int i, int apply)
             }
             mask >>= 1;
         }
+#ifdef TRACE_MCSSR
+        if (tread != mc->ncell[j] || (apply && sat == 0)) {
+            mctrace("BIASSAT,st=%d,j=%d,gnssid=%d,sat=%d,nsig=%d,cellmask=%X,"
+                    "ncell=%d,nread=%d,cont_sat0=%d,cont_invalid=%d,apply=%d,"
+                    "ssr_index=%d", MCSSR_ST_PB, j, mc->gidlist[j], sat, nsig,
+                    mc->cellmask[j], mc->ncell[j], tread, tsat0, tinv, apply, sat - 1);
+        }
+#endif
         if(apply) {
             ssr[sat-1].t0[5]    = mc->gt;
             ssr[sat-1].udi[5]   = udint;
@@ -573,6 +738,12 @@ extern int decode_qzss_l6emsg(rtcm_t *rtcm)
     int i=0,n,ibuff,mn,st,apply,ret,optprn;
     char *str;
     uint8_t mask;
+#ifdef TRACE_MCSSR
+    static int topt = 0;
+    int tpos, tlast = 0, tno = 0, texp, tib;
+    uint8_t tprev;
+    char tchk[128];
+#endif
 
     /* decode L6 message header (49 bits) */
     preamb=getbitu(rtcm->buff,i,32); i+=32; /* Preamble */
@@ -587,10 +758,24 @@ extern int decode_qzss_l6emsg(rtcm_t *rtcm)
     
     trace(3,"decode_qzss_l6emsg : %s,preamb=0x%08X,prn=%d,type=0x%X(vid=%d,mgfid=%d,csid=%d,anme=%d,si=%d),alert=%d\n",
         time_str(_mcssr.gt,3),preamb,prn,type,vid,mgfid,csid,anme,si,alert);
+#ifdef TRACE_MCSSR
+    if (!topt) {
+        mctrace("OPT,ver=%s,patch=%s,opt=%s", VER_MALIB, PATCH_LEVEL_MALIB, rtcm->opt);
+        topt = 1;
+    }
+    mctrace("L6,prn=%d,vid=%d,mgfid=%d,csid=%d,anme=%d,si=%d,alert=%d,"
+            "cur_prn=%d,prn_chk_cnt=%d,maxframe=%d,frame=%d,data_mn=%d,data_st=%d",
+            prn, vid, mgfid, csid, anme, si, alert, _mcssr.prn, _mcssr.prn_chk_cnt,
+            _mcssr.maxframe, _mcssr.frame, (int)getbitu(rtcm->buff, 49, 12),
+            (int)getbitu(rtcm->buff, 61, 4));
+#endif
 
     if (preamb != L6PREAMB) {
         trace(2,"decode_qzss_l6emsg : %s,invalid preamb=0x%08X\n",
             time_str(_mcssr.gt,3),preamb);
+#ifdef TRACE_MCSSR
+        mctrace("L6DROP,reason=preamble");
+#endif
         return -1;
     }
 
@@ -600,16 +785,27 @@ extern int decode_qzss_l6emsg(rtcm_t *rtcm)
         }
         else {
             trace(2,"decode_qzss_l6emsg : alert\n",time_str(_mcssr.gt,3));
+#ifdef TRACE_MCSSR
+            mctrace("L6DROP,reason=alert");
+#endif
             return -1;
         }
     }
 
-    if(vid!=2) return 0;           /* unsupport vendor ID */
+    if(vid!=2) {                   /* unsupport vendor ID */
+#ifdef TRACE_MCSSR
+        mctrace("L6DROP,reason=vendor");
+#endif
+        return 0;
+    }
 
     if ((str = strstr(rtcm->opt,"-MCSSR_PRN"))) {
         optprn = atoi(strstr(str,"=")+1);
         if(optprn != prn) {
             trace(3,"decode_qzss_l6emsg : -MCSSR_PRN=%d\n",optprn);
+#ifdef TRACE_MCSSR
+            mctrace("L6DROP,reason=opt_prn,opt_prn=%d", optprn);
+#endif
             return -1;
         }
     }
@@ -623,11 +819,17 @@ extern int decode_qzss_l6emsg(rtcm_t *rtcm)
                 trace(3,"decode_qzss_l6emsg : prn mismatch _mcssr.prn=%d,prn=%d,cnt=%d\n",
                     _mcssr.prn,prn,_mcssr.prn_chk_cnt);
                 if(_mcssr.prn_chk_cnt < MCSSR_MAX_PRN) {
+#ifdef TRACE_MCSSR
+                    mctrace("L6DROP,reason=prn_mismatch");
+#endif
                     return -1;
                 }
                 else {
                     trace(2,"decode_qzss_l6emsg :%s,prn switched %d -> %d\n",
                         time_str(_mcssr.gt,3),_mcssr.prn,prn);
+#ifdef TRACE_MCSSR
+                    mctrace("PRNSW,from=%d,to=%d", _mcssr.prn, prn);
+#endif
                     _mcssr.prn = prn;
                 }
             }
@@ -635,6 +837,12 @@ extern int decode_qzss_l6emsg(rtcm_t *rtcm)
         _mcssr.prn_chk_cnt = 0;
     }
 
+#ifdef TRACE_MCSSR
+    if (si == 1 && _mcssr.maxframe > 0 && _mcssr.frame < _mcssr.maxframe) {
+        mctrace("SFABORT,reason=si_first,frame=%d,maxframe=%d",
+                _mcssr.frame, _mcssr.maxframe);
+    }
+#endif
     if(si==1) _mcssr.maxframe = 0; /* Subframe Indicator : First Data */
 
     /* frame recognition */
@@ -644,15 +852,25 @@ extern int decode_qzss_l6emsg(rtcm_t *rtcm)
         if(mn != RTCM_MN_CSSR) {
             trace(2,"decode_qzss_l6emsg :%s,invalid mn=%d\n",
                 time_str(_mcssr.gt,3),mn);
+#ifdef TRACE_MCSSR
+            mctrace("L6DROP,reason=frame_start_mn,mn=%d", mn);
+#endif
             return -1;
         }
         if((_mcssr.maxframe = framelen[st]) < 1) {
             trace(2,"decode_qzss_l6emsg :%s,invalid frame start st=%d\n",
                 time_str(_mcssr.gt,3),st);
+#ifdef TRACE_MCSSR
+            mctrace("L6DROP,reason=frame_start_st,st=%d", st);
+#endif
             return -1;
         }
         trace(3,"decode_qzss_l6emsg : %s,mn=%d,st=%d,maxframe=%d\n",
             time_str(_mcssr.gt,3),mn,st,_mcssr.maxframe);
+#ifdef TRACE_MCSSR
+        mctrace("SFSTART,st=%d,maxframe=%d,si=%d,prn=%d,mgfid=%d",
+                st, _mcssr.maxframe, si, prn, mgfid);
+#endif
         _mcssr.frame=0;
         _mcssr.ibuff=0;
     }
@@ -667,25 +885,47 @@ extern int decode_qzss_l6emsg(rtcm_t *rtcm)
         case 3: ibuff=423; n = 2; mask = 0xF8; break;
         case 4: ibuff=635; n = 3; mask = 0xF0; break;
         case 5: ibuff=847; n = 4; mask = 0xE0; break;
-        default:trace(3,"decode_qzss_l6emsg : invalid frame\n"); return -1;
+        default:trace(3,"decode_qzss_l6emsg : invalid frame\n");
+#ifdef TRACE_MCSSR
+                mctrace("L6DROP,reason=frame_overflow,frame=%d,maxframe=%d",
+                        _mcssr.frame, _mcssr.maxframe);
+#endif
+                return -1;
     }
+#ifdef TRACE_MCSSR
+    tib = ibuff;
+    tprev = _mcssr.buff[ibuff]; /* frame 1: byte left by the previous subframe */
+#endif
     _mcssr.buff[ibuff++] |= (unsigned char)getbitu(rtcm->buff, i, n); i += n;
     while (i < L6HEAD_BITLEN + L6DATA_BITLEN) {
         _mcssr.buff[ibuff++] = (unsigned char)getbitu(rtcm->buff, i, 8); i += 8;
     }
     _mcssr.buff[ibuff - 1] &= mask;
+#ifdef TRACE_MCSSR
+    mctrace("FRM,frame=%d,maxframe=%d,byte_start=%d,byte_end=%d,or_byte=%02X",
+            _mcssr.frame, _mcssr.maxframe, tib, ibuff, tprev);
+#endif
 
     if(_mcssr.frame != _mcssr.maxframe) return 0; /* no message */
 
     ret=10; /* input ssr messages */
     i=0;
+#ifdef TRACE_MCSSR
+    mctrace("SF,prn=%d,mgfid=%d,cur_mgfid=%d,frames=%d,nbit=%d",
+            prn, mgfid, _mcssr.mgfid, _mcssr.frame, L6DATA_BITLEN * _mcssr.maxframe);
+#endif
     while(i < L6DATA_BITLEN * _mcssr.maxframe) {
         mn = getbitu(_mcssr.buff,i,12); i+=12; /* Message Number */
         if(mn != RTCM_MN_CSSR) continue;
         st = getbitu(_mcssr.buff,i, 4); i+= 4; /* Message Sub Type ID */
-        if((st != MCSSR_ST_MASK) && (st != MCSSR_ST_OC) && 
+        if((st != MCSSR_ST_MASK) && (st != MCSSR_ST_OC) &&
            (st != MCSSR_ST_CC)   && (st != MCSSR_ST_CB) &&
            (st != MCSSR_ST_PB)   && (st != MCSSR_ST_URA)) continue;
+#ifdef TRACE_MCSSR
+        tpos = i - 16; /* bits from tlast to tpos are skipped by the search */
+        texp = (st == MCSSR_ST_MASK)? -1: mctrace_explen(&_mcssr, st);
+        mctrace_chk(&_mcssr, tpos, st, tchk);
+#endif
         if (st == MCSSR_ST_MASK) {
             if(_mcssr.mgfid != mgfid) {
                 trace(2,"decode_qzss_l6emsg :%s,mgfid switched %d -> %d\n",
@@ -725,6 +965,10 @@ extern int decode_qzss_l6emsg(rtcm_t *rtcm)
                 break;
             }
         }
+#ifdef TRACE_MCSSR
+        mctrace_msg(&_mcssr, ++tno, tpos, tpos - tlast, st, i, texp, tchk);
+        if (i >= 0) tlast = i;
+#endif
         if(i<0) {
             trace(2,"decode_qzss_l6emsg : decode error st=%d\n",st);
             ret = -1;
@@ -732,6 +976,9 @@ extern int decode_qzss_l6emsg(rtcm_t *rtcm)
         }
         rtcm->time = _mcssr.gt;
     }
+#ifdef TRACE_MCSSR
+    mctrace_sfend(&_mcssr, tlast, L6DATA_BITLEN * _mcssr.maxframe, ret);
+#endif
     _mcssr.maxframe = 0;
     trace(4,"decode_qzss_l6emsg : %s,frames=%d\n",
         time_str(_mcssr.gt,3),_mcssr.frame);
@@ -750,6 +997,12 @@ extern void init_mcssr(const gtime_t gt)
     _mcssr.prn   = -1; /* invalid value */
     _mcssr.tow0  = -1; /* invalid value */
     _mcssr.frame =  0; /* initial value */
+#ifdef TRACE_MCSSR
+    {
+        char gs[32];
+        mctrace("INIT,gt=%s", mctrace_gt(gt, gs));
+    }
+#endif
 }
 
 /* stack QZSS L6E message ----------------------------------------------------
